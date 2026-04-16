@@ -126,6 +126,7 @@ jobs:
           }
 
       - name: Package Artifacts
+        if: ${{ matrix.use_ndk != true }}
         shell: pwsh
         run: |
           $cleanTarget = "${{ matrix.target }}".Replace(".2.17", "")
@@ -148,6 +149,7 @@ jobs:
           Compress-Archive -Path "$artifactDir/*" -DestinationPath "dist/rua-${{ matrix.name }}.zip" -Force
 
       - name: Upload Artifacts
+        if: ${{ matrix.use_ndk != true }}
         uses: actions/upload-artifact@v4
         with:
           name: rua-${{ matrix.name }}
@@ -155,7 +157,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Release Assets
-        if: ${{ always() && needs.prepare_release_tag.outputs.should_release == 'true' }}
+        if: ${{ always() && matrix.use_ndk != true && needs.prepare_release_tag.outputs.should_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare_release_tag.outputs.release_tag }}
