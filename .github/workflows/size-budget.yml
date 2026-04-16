@@ -1,0 +1,36 @@
+name: Size Budget
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-size:
+    name: Linux Binary Size
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Release CLI
+        run: cargo build -p rua_cli --release --locked
+
+      - name: Measure and Enforce Size
+        run: |
+          BIN=target/release/rua
+          SIZE=$(stat -c%s "$BIN")
+          echo "rua_size_bytes=$SIZE" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rua binary size: $SIZE bytes"
+          MAX=800000
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "Binary exceeds size budget ($MAX bytes)"
+            exit 1
+          fi

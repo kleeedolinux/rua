@@ -1,0 +1,45 @@
+name: Platform Smoke
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI (release)
+        run: cargo build -p rua_cli --release --locked
+
+      - name: Smoke Run (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          ./target/release/rua examples/01_arith_if.rua
+          ./target/release/rua examples/11_registry_router.rua
+          ./target/release/rua examples/12_native_module_require.rua
+          ./target/release/rua examples/14_unsafe_ffi_host_call.rua
+
+      - name: Smoke Run (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\target\release\rua.exe examples\01_arith_if.rua
+          .\target\release\rua.exe examples\11_registry_router.rua
+          .\target\release\rua.exe examples\12_native_module_require.rua

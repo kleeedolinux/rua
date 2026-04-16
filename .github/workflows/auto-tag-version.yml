@@ -1,0 +1,78 @@
+name: Auto Tag From version.rua
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag-from-version-file:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version.rua
+        id: version
+        shell: bash
+        run: |
+          if [[ ! -f version.rua ]]; then
+            echo "version.rua not found"
+            exit 1
+          fi
+
+          VERSION=$(sed -nE 's/^\s*version\s*=\s*"([^"]+)"\s*$/\1/p' version.rua | head -n1)
+          if [[ -z "$VERSION" ]]; then
+            echo "Could not parse version from version.rua. Expected: version = \"X.Y.Z\""
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version format: $VERSION"
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check existing tag
+        id: check
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "Rua $VERSION"
+          git push origin "$TAG"
+
+      - name: Summary
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if [[ "${{ steps.check.outputs.exists }}" == "true" ]]; then
+            echo "Tag already exists: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Created and pushed tag: $TAG" >> "$GITHUB_STEP_SUMMARY"
+          fi
