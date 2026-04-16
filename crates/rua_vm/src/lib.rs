@@ -4,8 +4,12 @@ mod value;
 mod vm;
 
 pub use error::VmError;
+pub use gc::{AllocatorStrategy, GcProfile};
 pub use value::{ObjRef, Value};
-pub use vm::{ProcessId, Vm, VmConfig, VmState};
+pub use vm::{
+    FfiSignature, FfiType, ProcessId, Vm, VmConfig, VmDiagnostic, VmFrameTrace, VmProfile,
+    VmState,
+};
 
 #[cfg(test)]
 mod tests {
@@ -78,6 +82,59 @@ mod tests {
         assert_eq!(value, Value::Integer(9));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_system_ffi_getpid_works() {
+        let module = compile_source("unsafe ffi(\"libc.getpid\")").unwrap();
+        let mut vm = Vm::new(module);
+        vm.register_system_ffi_capability(
+            "libc.getpid",
+            "libc.so.6",
+            "getpid",
+            crate::FfiSignature {
+                params: vec![],
+                ret: crate::FfiType::UInt64,
+            },
+        );
+        let value = vm.run().unwrap();
+        match value {
+            Value::Integer(v) => assert!(v > 0),
+            _ => panic!("expected integer pid"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_system_ffi_strlen_works() {
+        let module = compile_source("unsafe ffi(\"libc.strlen\", \"hello\")").unwrap();
+        let mut vm = Vm::new(module);
+        vm.register_system_ffi_capability(
+            "libc.strlen",
+            "libc.so.6",
+            "strlen",
+            crate::FfiSignature {
+                params: vec![crate::FfiType::CString],
+                ret: crate::FfiType::UInt64,
+            },
+        );
+        let value = vm.run().unwrap();
+        assert_eq!(value, Value::Integer(5));
+    }
+
+    #[test]
+    fn recursive_local_function_works() {
+        let source = "local fat = fn(n) if n == 0 then 1 else n * fat(n - 1) end end fat(5)";
+        let value = eval(source);
+        assert_eq!(value, Value::Integer(120));
+    }
+
+    #[test]
+    fn nested_receive_can_capture_outer_bindings() {
+        let source = "send(self(), { type = \"a\", value = 10 }) send(self(), { type = \"b\", value = 32 }) receive case { type = \"a\", value = a } -> receive case { type = \"b\", value = b } -> a + b end end";
+        let value = eval(source);
+        assert_eq!(value, Value::Integer(42));
+    }
+
     #[test]
     fn receive_after_respects_timeout() {
         let source = "receive case { type = \"x\" } -> 1 after 3 -> 9 end";
@@ -116,5 +173,20 @@ mod tests {
         vm.register_native_module("m", mv);
         let value = vm.run().unwrap();
         assert_eq!(value, Value::Integer(42));
+    }
+
+    #[test]
+    fn stdlib_math_string_table_subset() {
+        let source = "local a = math.max(10, 2) local b = string.upper(\"rua\") local c = table.len({1,2,3}) if b == \"RUA\" then a + c else 0 end";
+        let value = eval(source);
+        assert_eq!(value, Value::Integer(13));
+    }
+
+    #[test]
+    fn ffi_requires_capability_or_explicit_unrestricted_mode() {
+        let module = compile_source("unsafe ffi(\"libc.so.6\", \"getpid\")").unwrap();
+        let mut vm = Vm::new(module);
+        let err = vm.run().unwrap_err();
+        assert!(matches!(err, crate::VmError::SecurityViolation(_)));
     }
 }

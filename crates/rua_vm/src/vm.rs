@@ -1,26 +1,103 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::{c_char, c_void, CString};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rua::ast::{BinaryOp, UnaryOp};
+use rua::bytecode::{decode_module, validate_module};
+use rua::frontend::compile_source;
 use rua::ir::{
     CaptureRef, ConstId, Constant, Function, FunctionId, Instr, Module, Pattern, ReceiveAfter,
     ReceiveCase,
 };
+#[cfg(feature = "builtin_sha256_verify")]
+use sha2::{Digest, Sha256};
 
 use crate::error::VmError;
-use crate::gc::{GcConfig, GcTelemetry, Heap, HeapObject};
+use crate::gc::{GcConfig, GcProfile, GcTelemetry, Heap, HeapObject};
 use crate::value::{Builtin, Value};
 
 pub type ProcessId = u64;
 type MonitorRef = u64;
 type HostFunction = dyn Fn(&[Value]) -> Result<Value, VmError>;
 type ModuleLoader = dyn Fn() -> Result<Value, VmError>;
+type ModuleVerifier = dyn Fn(&str, &[u8], &[u8]) -> bool;
+
+#[cfg(unix)]
+const RTLD_NOW: i32 = 2;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlclose(handle: *mut c_void) -> i32;
+}
+
+struct NativeLibrary {
+    handle: *mut c_void,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmProfile {
+    EmbeddedSmall,
+    Balanced,
+    Throughput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiType {
+    Int64,
+    UInt64,
+    Bool,
+    CString,
+    Ptr,
+    Void,
+}
+
+#[derive(Debug, Clone)]
+pub struct FfiSignature {
+    pub params: Vec<FfiType>,
+    pub ret: FfiType,
+}
+
+#[derive(Debug, Clone)]
+struct SystemFfiCapability {
+    lib: String,
+    symbol: String,
+    signature: FfiSignature,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmFrameTrace {
+    pub function: Option<String>,
+    pub function_id: usize,
+    pub ip: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmDiagnostic {
+    pub code: &'static str,
+    pub message: String,
+    pub process_id: ProcessId,
+    pub stack_trace: Vec<VmFrameTrace>,
+}
 
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     pub max_steps: usize,
     pub gc_slice_budget: usize,
     pub timeslice_instructions: usize,
+    pub max_processes: usize,
+    pub max_mailbox_messages: usize,
+    pub max_stack_values: usize,
+    pub max_call_depth: usize,
+    pub max_heap_objects: usize,
+    pub max_module_bytes: usize,
+    pub max_module_cache_entries: usize,
+    pub allow_unrestricted_system_ffi: bool,
+    pub require_signed_modules: bool,
+    pub module_search_paths: Vec<PathBuf>,
 }
 
 impl Default for VmConfig {
@@ -29,6 +106,16 @@ impl Default for VmConfig {
             max_steps: 1_000_000,
             gc_slice_budget: 128,
             timeslice_instructions: 64,
+            max_processes: 4096,
+            max_mailbox_messages: 50_000,
+            max_stack_values: 100_000,
+            max_call_depth: 2048,
+            max_heap_objects: 1_000_000,
+            max_module_bytes: 4 * 1024 * 1024,
+            max_module_cache_entries: 1024,
+            allow_unrestricted_system_ffi: false,
+            require_signed_modules: false,
+            module_search_paths: vec![PathBuf::from(".")],
         }
     }
 }
@@ -50,6 +137,7 @@ struct CallFrame {
     ip: usize,
     locals: Vec<Value>,
     upvalues: Vec<Value>,
+    self_closure: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +199,9 @@ pub struct Vm {
     host_functions: HashMap<String, Box<HostFunction>>,
     native_modules: HashMap<String, Value>,
     module_loaders: HashMap<String, Box<ModuleLoader>>,
+    module_verifier: Option<Box<ModuleVerifier>>,
+    ffi_libs: HashMap<String, NativeLibrary>,
+    ffi_caps: HashMap<String, SystemFfiCapability>,
     processes: HashMap<ProcessId, Process>,
     run_queue: VecDeque<ProcessId>,
     queued: HashSet<ProcessId>,
@@ -125,6 +216,7 @@ pub struct Vm {
     ticks: u64,
     halted: bool,
     result: Option<Value>,
+    last_diagnostic: Option<VmDiagnostic>,
 }
 
 impl Vm {
@@ -143,6 +235,7 @@ impl Vm {
                 ip: 0,
                 locals: Vec::new(),
                 upvalues: Vec::new(),
+                self_closure: None,
             }],
             mailbox: VecDeque::new(),
             unsafe_depth: 0,
@@ -160,6 +253,9 @@ impl Vm {
             host_functions: HashMap::new(),
             native_modules: HashMap::new(),
             module_loaders: HashMap::new(),
+            module_verifier: None,
+            ffi_libs: HashMap::new(),
+            ffi_caps: HashMap::new(),
             processes: HashMap::from([(main_pid, main_process)]),
             run_queue: VecDeque::from([main_pid]),
             queued: HashSet::from([main_pid]),
@@ -174,6 +270,7 @@ impl Vm {
             ticks: 0,
             halted: false,
             result: None,
+            last_diagnostic: None,
         };
         vm.install_builtins();
         vm.gc_set_threshold(1024);
@@ -198,12 +295,84 @@ impl Vm {
         self.module_loaders.insert(name.into(), Box::new(loader));
     }
 
+    pub fn register_module_verifier<F>(&mut self, verifier: F)
+    where
+        F: Fn(&str, &[u8], &[u8]) -> bool + 'static,
+    {
+        self.module_verifier = Some(Box::new(verifier));
+    }
+
+    pub fn register_system_ffi_capability(
+        &mut self,
+        name: impl Into<String>,
+        lib: impl Into<String>,
+        symbol: impl Into<String>,
+        signature: FfiSignature,
+    ) {
+        self.ffi_caps.insert(
+            name.into(),
+            SystemFfiCapability {
+                lib: lib.into(),
+                symbol: symbol.into(),
+                signature,
+            },
+        );
+    }
+
+    pub fn set_profile(&mut self, profile: VmProfile) {
+        match profile {
+            VmProfile::EmbeddedSmall => {
+                self.config.gc_slice_budget = 64;
+                self.heap.set_profile(GcProfile::LowLatency);
+            }
+            VmProfile::Balanced => {
+                self.config.gc_slice_budget = 128;
+                self.heap.set_profile(GcProfile::Balanced);
+            }
+            VmProfile::Throughput => {
+                self.config.gc_slice_budget = 512;
+                self.heap.set_profile(GcProfile::Throughput);
+            }
+        }
+    }
+
+    pub fn set_limits(
+        &mut self,
+        max_steps: usize,
+        max_processes: usize,
+        max_mailbox_messages: usize,
+        max_stack_values: usize,
+        max_heap_objects: usize,
+    ) {
+        self.config.max_steps = max_steps.max(1);
+        self.config.max_processes = max_processes.max(1);
+        self.config.max_mailbox_messages = max_mailbox_messages.max(1);
+        self.config.max_stack_values = max_stack_values.max(1);
+        self.config.max_heap_objects = max_heap_objects.max(1);
+    }
+
+    pub fn add_module_search_path(&mut self, path: impl Into<PathBuf>) {
+        self.config.module_search_paths.push(path.into());
+    }
+
+    pub fn set_require_signed_modules(&mut self, required: bool) {
+        self.config.require_signed_modules = required;
+    }
+
+    pub fn set_allow_unrestricted_system_ffi(&mut self, allowed: bool) {
+        self.config.allow_unrestricted_system_ffi = allowed;
+    }
+
     pub fn gc_set_threshold(&mut self, threshold: usize) {
         self.heap.set_threshold(threshold);
     }
 
     pub fn gc_set_full_every_minor(&mut self, count: usize) {
         self.heap.set_full_every_minor(count);
+    }
+
+    pub fn gc_set_profile(&mut self, profile: GcProfile) {
+        self.heap.set_profile(profile);
     }
 
     pub fn gc_collect_now(&mut self) {
@@ -213,6 +382,10 @@ impl Vm {
 
     pub fn gc_telemetry(&self) -> &GcTelemetry {
         self.heap.telemetry()
+    }
+
+    pub fn last_diagnostic(&self) -> Option<&VmDiagnostic> {
+        self.last_diagnostic.as_ref()
     }
 
     pub fn state(&self) -> VmState {
@@ -244,7 +417,10 @@ impl Vm {
             }
             self.step()?;
         }
-        Err(VmError::TypeError("max step budget exceeded".into()))
+        self.fail(VmError::LimitExceeded {
+            limit: "max_steps",
+            max: self.config.max_steps,
+        })
     }
 
     pub fn step(&mut self) -> Result<(), VmError> {
@@ -282,6 +458,10 @@ impl Vm {
                 break;
             }
             self.collect_garbage_if_needed();
+            if let Err(e) = self.enforce_limits() {
+                step_result = Err(e);
+                break;
+            }
             let keep_running = self
                 .processes
                 .get(&pid)
@@ -301,7 +481,10 @@ impl Vm {
             self.enqueue_ready(pid);
         }
 
-        step_result
+        match step_result {
+            Ok(()) => Ok(()),
+            Err(e) => self.fail(e),
+        }
     }
 
     pub fn format_value(&self, value: &Value) -> String {
@@ -392,6 +575,13 @@ impl Vm {
                     .unwrap_or(Value::Nil);
                 self.process_mut(pid)?.stack.push(value);
             }
+            Instr::LoadSelf => {
+                let value = self.process(pid)?.call_stack[frame_idx]
+                    .self_closure
+                    .clone()
+                    .unwrap_or(Value::Nil);
+                self.process_mut(pid)?.stack.push(value);
+            }
             Instr::LoadGlobal(id) => {
                 let name = self.const_symbol(self.current_function(pid)?, id)?;
                 let value = self
@@ -466,6 +656,10 @@ impl Vm {
                                 .upvalues
                                 .get(id.0)
                                 .cloned()
+                                .unwrap_or(Value::Nil),
+                            CaptureRef::SelfClosure => proc.call_stack[frame_idx]
+                                .self_closure
+                                .clone()
                                 .unwrap_or(Value::Nil),
                         })
                         .collect::<Vec<_>>()
@@ -600,11 +794,19 @@ impl Vm {
             locals[i] = arg;
         }
 
+        if self.process(pid)?.call_stack.len() >= self.config.max_call_depth {
+            return Err(VmError::LimitExceeded {
+                limit: "max_call_depth",
+                max: self.config.max_call_depth,
+            });
+        }
+
         self.process_mut(pid)?.call_stack.push(CallFrame {
             function: function_id,
             ip: 0,
             locals,
             upvalues: captures,
+            self_closure: Some(Value::Closure(closure_id)),
         });
         Ok(())
     }
@@ -629,12 +831,20 @@ impl Vm {
             locals[i] = arg;
         }
 
+        let max_call_depth = self.config.max_call_depth;
         let proc = self.process_mut(pid)?;
+        if proc.call_stack.len() >= max_call_depth {
+            return Err(VmError::LimitExceeded {
+                limit: "max_call_depth",
+                max: max_call_depth,
+            });
+        }
         proc.call_stack.push(CallFrame {
             function: function_id,
             ip: 0,
             locals,
             upvalues,
+            self_closure: None,
         });
         proc.blocked = false;
         Ok(())
@@ -659,7 +869,7 @@ impl Vm {
                     proc.mailbox.remove(msg_idx);
                     proc.waiting_receive = None;
                     proc.blocked = false;
-                    let upvalues = self.process(pid)?.call_stack[frame_idx].upvalues.clone();
+                    let upvalues = self.capture_values(pid, frame_idx, &case.captures)?;
                     self.call_function_with_upvalues(pid, case.handler, bindings, upvalues)?;
                     return Ok(());
                 }
@@ -718,19 +928,19 @@ impl Vm {
                 }
             }
 
-            let upvalues = self.process(pid)?.call_stack[frame_idx].upvalues.clone();
             self.process_mut(pid)?.waiting_receive = Some(ReceiveWaitState {
                 frame_idx,
                 instr_ip: receive_ip,
                 body_handler: after_case.body_handler,
-                upvalues: upvalues.clone(),
+                upvalues: self.capture_values(pid, frame_idx, &after_case.body_captures)?,
                 stage: ReceiveWaitStage::EvaluatingTimeout,
             });
             {
                 let proc = self.process_mut(pid)?;
                 proc.call_stack[frame_idx].ip = proc.call_stack[frame_idx].ip.saturating_sub(1);
             }
-            self.call_function_with_upvalues(pid, after_case.timeout_handler, Vec::new(), upvalues)?;
+            let timeout_upvalues = self.capture_values(pid, frame_idx, &after_case.timeout_captures)?;
+            self.call_function_with_upvalues(pid, after_case.timeout_handler, Vec::new(), timeout_upvalues)?;
             return Ok(());
         }
 
@@ -817,6 +1027,12 @@ impl Vm {
                     .processes
                     .get_mut(&target)
                     .ok_or(VmError::ProcessNotFound(target))?;
+                if target_proc.mailbox.len() >= self.config.max_mailbox_messages {
+                    return Err(VmError::LimitExceeded {
+                        limit: "max_mailbox_messages",
+                        max: self.config.max_mailbox_messages,
+                    });
+                }
                 target_proc.mailbox.push_back(msg);
                 if target_proc.blocked && !target_proc.halted {
                     target_proc.blocked = false;
@@ -1083,7 +1299,15 @@ impl Vm {
                     self.native_modules.insert(name, value.clone());
                     return Ok(value);
                 }
-                Err(VmError::UnknownGlobal(format!("module:{name}")))
+                let loaded = self.load_module_from_search_path(&name)?;
+                self.native_modules.insert(name.clone(), loaded.clone());
+                if self.native_modules.len() > self.config.max_module_cache_entries {
+                    return Err(VmError::LimitExceeded {
+                        limit: "max_module_cache_entries",
+                        max: self.config.max_module_cache_entries,
+                    });
+                }
+                Ok(loaded)
             }
             Builtin::MathAbs => {
                 if args.len() != 1 {
@@ -1216,11 +1440,76 @@ impl Vm {
                         ))
                     }
                 };
-                let host = self
-                    .host_functions
-                    .get(&name)
-                    .ok_or_else(|| VmError::UnknownGlobal(format!("ffi:{name}")))?;
-                host(&args[1..])
+                if self.host_functions.contains_key(&name) {
+                    let host = self
+                        .host_functions
+                        .get(&name)
+                        .ok_or_else(|| VmError::UnknownGlobal(format!("ffi:{name}")))?;
+                    return host(&args[1..]);
+                }
+                self.call_system_ffi_capability_or_unrestricted(&args)
+            }
+            Builtin::FfiRegister => {
+                if !self.is_unsafe_context(pid)? {
+                    return Err(VmError::TypeError("ffi_register requires unsafe context".into()));
+                }
+                if args.len() != 5 {
+                    return Err(VmError::ArityMismatch {
+                        expected: 5,
+                        got: args.len(),
+                    });
+                }
+                let cap = match &args[0] {
+                    Value::String(v) => v.clone(),
+                    _ => return Err(VmError::TypeError("ffi_register cap name must be string".into())),
+                };
+                let lib = match &args[1] {
+                    Value::String(v) => v.clone(),
+                    _ => return Err(VmError::TypeError("ffi_register lib must be string".into())),
+                };
+                let symbol = match &args[2] {
+                    Value::String(v) => v.clone(),
+                    _ => {
+                        return Err(VmError::TypeError(
+                            "ffi_register symbol must be string".into(),
+                        ))
+                    }
+                };
+                let ret = match &args[3] {
+                    Value::String(v) => parse_ffi_type_token(v)
+                        .ok_or_else(|| VmError::TypeError("ffi_register invalid return type".into()))?,
+                    _ => {
+                        return Err(VmError::TypeError(
+                            "ffi_register return type must be string".into(),
+                        ))
+                    }
+                };
+                let params_csv = match &args[4] {
+                    Value::String(v) => v,
+                    _ => {
+                        return Err(VmError::TypeError(
+                            "ffi_register param csv must be string".into(),
+                        ))
+                    }
+                };
+                let mut params = Vec::new();
+                for part in params_csv
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    let ty = parse_ffi_type_token(part).ok_or_else(|| {
+                        VmError::TypeError(format!("ffi_register invalid param type: {part}"))
+                    })?;
+                    params.push(ty);
+                }
+                self.register_system_ffi_capability(
+                    cap,
+                    lib,
+                    symbol,
+                    FfiSignature { params, ret },
+                );
+                Ok(Value::Nil)
             }
         }
     }
@@ -1291,6 +1580,8 @@ impl Vm {
             .insert("get_meta".into(), Value::Builtin(Builtin::GetMeta));
         self.globals
             .insert("require".into(), Value::Builtin(Builtin::Require));
+        self.globals
+            .insert("ffi_register".into(), Value::Builtin(Builtin::FfiRegister));
         self.globals.insert("ffi".into(), Value::Builtin(Builtin::Ffi));
 
         let math = self.heap.alloc_record(
@@ -1350,6 +1641,12 @@ impl Vm {
         }
 
         let child_pid = self.next_pid;
+        if self.processes.len() >= self.config.max_processes {
+            return Err(VmError::LimitExceeded {
+                limit: "max_processes",
+                max: self.config.max_processes,
+            });
+        }
         self.next_pid += 1;
 
         let child = Process {
@@ -1359,6 +1656,7 @@ impl Vm {
                 ip: 0,
                 locals: vec![Value::Nil; function_arity.max(8)],
                 upvalues: captures,
+                self_closure: Some(Value::Closure(closure_id)),
             }],
             mailbox: VecDeque::new(),
             unsafe_depth: 0,
@@ -1677,6 +1975,27 @@ impl Vm {
         Ok(())
     }
 
+    fn capture_values(
+        &self,
+        pid: ProcessId,
+        frame_idx: usize,
+        captures: &[CaptureRef],
+    ) -> Result<Vec<Value>, VmError> {
+        let proc = self.process(pid)?;
+        let frame = proc
+            .call_stack
+            .get(frame_idx)
+            .ok_or(VmError::InvalidInstructionPointer)?;
+        Ok(captures
+            .iter()
+            .map(|capture| match capture {
+                CaptureRef::Local(id) => frame.locals.get(id.0).cloned().unwrap_or(Value::Nil),
+                CaptureRef::Upvalue(id) => frame.upvalues.get(id.0).cloned().unwrap_or(Value::Nil),
+                CaptureRef::SelfClosure => frame.self_closure.clone().unwrap_or(Value::Nil),
+            })
+            .collect())
+    }
+
     fn pop(&mut self, pid: ProcessId) -> Result<Value, VmError> {
         self.process_mut(pid)?.stack.pop().ok_or(VmError::StackUnderflow)
     }
@@ -1759,6 +2078,544 @@ impl Vm {
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Bool(cmp(a, b as f64))),
             (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(cmp(a, b))),
             _ => Err(VmError::TypeError("comparison expects numeric operands".into())),
+        }
+    }
+
+    fn call_system_ffi_capability_or_unrestricted(
+        &mut self,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        if args.is_empty() {
+            return Err(VmError::ArityMismatch {
+                expected: 1,
+                got: 0,
+            });
+        }
+        let name = match &args[0] {
+            Value::String(v) => v.as_str(),
+            _ => return Err(VmError::TypeError("ffi expects capability name string".into())),
+        };
+
+        if let Some(cap) = self.ffi_caps.get(name).cloned() {
+            return self.call_system_ffi_typed(&cap.lib, &cap.symbol, &cap.signature, &args[1..]);
+        }
+
+        if !self.config.allow_unrestricted_system_ffi {
+            return Err(VmError::SecurityViolation(format!(
+                "ffi capability not allowed: {name}"
+            )));
+        }
+
+        if args.len() < 3 {
+            return Err(VmError::ArityMismatch {
+                expected: 3,
+                got: args.len(),
+            });
+        }
+
+        let lib = match &args[0] {
+            Value::String(v) => v.clone(),
+            _ => return Err(VmError::TypeError("ffi expects library name".into())),
+        };
+        let symbol = match &args[1] {
+            Value::String(v) => v.clone(),
+            _ => return Err(VmError::TypeError("ffi expects symbol name".into())),
+        };
+        let signature = infer_unrestricted_signature(&args[2..]);
+        self.call_system_ffi_typed(&lib, &symbol, &signature, &args[2..])
+    }
+
+    fn call_system_ffi_typed(
+        &mut self,
+        lib_name: &str,
+        symbol: &str,
+        signature: &FfiSignature,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        if args.len() != signature.params.len() {
+            return Err(VmError::ArityMismatch {
+                expected: signature.params.len(),
+                got: args.len(),
+            });
+        }
+        let handle = self.open_ffi_library(lib_name)?;
+        let sym = self.lookup_ffi_symbol(handle, symbol)?;
+        let native_args = self.to_native_ffi_args_typed(args, &signature.params)?;
+        self.invoke_ffi_symbol_typed(sym, &native_args, signature.ret)
+    }
+
+    fn to_native_ffi_args_typed(
+        &self,
+        args: &[Value],
+        param_types: &[FfiType],
+    ) -> Result<NativeFfiArgs, VmError> {
+        let mut converted = Vec::with_capacity(args.len());
+        let mut string_storage = Vec::new();
+        for (value, ty) in args.iter().zip(param_types.iter()) {
+            let native = match ty {
+                FfiType::Int64 => match value {
+                    Value::Integer(v) => *v as usize,
+                    _ => {
+                        return Err(VmError::TypeError(
+                            "ffi int64 argument expects integer".into(),
+                        ))
+                    }
+                },
+                FfiType::UInt64 | FfiType::Ptr => match value {
+                    Value::Integer(v) if *v >= 0 => *v as usize,
+                    Value::Pid(v) => *v as usize,
+                    Value::Nil => 0usize,
+                    _ => {
+                        return Err(VmError::TypeError(
+                            "ffi uint64/ptr argument expects non-negative integer/pid/nil".into(),
+                        ))
+                    }
+                },
+                FfiType::Bool => match value {
+                    Value::Bool(v) => usize::from(*v),
+                    _ => return Err(VmError::TypeError("ffi bool argument expects bool".into())),
+                },
+                FfiType::CString => match value {
+                    Value::String(s) => {
+                        let c = CString::new(s.as_str()).map_err(|_| {
+                            VmError::TypeError("ffi cstring arg contains interior NUL byte".into())
+                        })?;
+                        let ptr = c.as_ptr() as usize;
+                        string_storage.push(c);
+                        ptr
+                    }
+                    Value::Nil => 0usize,
+                    _ => {
+                        return Err(VmError::TypeError(
+                            "ffi cstring argument expects string or nil".into(),
+                        ))
+                    }
+                },
+                FfiType::Void => {
+                    return Err(VmError::TypeError(
+                        "ffi void is invalid for parameter type".into(),
+                    ))
+                }
+            };
+            converted.push(native);
+        }
+        Ok(NativeFfiArgs {
+            words: converted,
+            string_storage,
+        })
+    }
+
+    #[cfg(unix)]
+    fn open_ffi_library(&mut self, lib_name: &str) -> Result<*mut c_void, VmError> {
+        if let Some(lib) = self.ffi_libs.get(lib_name) {
+            return Ok(lib.handle);
+        }
+        let name = CString::new(lib_name)
+            .map_err(|_| VmError::TypeError("ffi library path contains interior NUL byte".into()))?;
+        let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
+        if handle.is_null() {
+            return Err(VmError::TypeError(format!("failed to load library: {lib_name}")));
+        }
+        self.ffi_libs
+            .insert(lib_name.to_string(), NativeLibrary { handle });
+        Ok(handle)
+    }
+
+    #[cfg(not(unix))]
+    fn open_ffi_library(&mut self, lib_name: &str) -> Result<*mut c_void, VmError> {
+        let _ = lib_name;
+        Err(VmError::TypeError(
+            "system ffi dynamic loading is only supported on unix in this build".into(),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn lookup_ffi_symbol(&self, handle: *mut c_void, symbol: &str) -> Result<*mut c_void, VmError> {
+        let symbol_name = CString::new(symbol)
+            .map_err(|_| VmError::TypeError("ffi symbol contains interior NUL byte".into()))?;
+        let sym = unsafe { dlsym(handle, symbol_name.as_ptr()) };
+        if sym.is_null() {
+            return Err(VmError::TypeError(format!(
+                "failed to resolve symbol: {symbol}"
+            )));
+        }
+        Ok(sym)
+    }
+
+    #[cfg(not(unix))]
+    fn lookup_ffi_symbol(&self, handle: *mut c_void, symbol: &str) -> Result<*mut c_void, VmError> {
+        let _ = (handle, symbol);
+        Err(VmError::TypeError(
+            "system ffi dynamic loading is only supported on unix in this build".into(),
+        ))
+    }
+
+    fn invoke_ffi_symbol_typed(
+        &self,
+        sym: *mut c_void,
+        args: &NativeFfiArgs,
+        ret: FfiType,
+    ) -> Result<Value, VmError> {
+        let _keep_alive = &args.string_storage;
+        let out = unsafe {
+            match args.words.len() {
+                0 => {
+                    let f: extern "C" fn() -> usize = std::mem::transmute(sym);
+                    f()
+                }
+                1 => {
+                    let f: extern "C" fn(usize) -> usize = std::mem::transmute(sym);
+                    f(args.words[0])
+                }
+                2 => {
+                    let f: extern "C" fn(usize, usize) -> usize = std::mem::transmute(sym);
+                    f(args.words[0], args.words[1])
+                }
+                3 => {
+                    let f: extern "C" fn(usize, usize, usize) -> usize = std::mem::transmute(sym);
+                    f(args.words[0], args.words[1], args.words[2])
+                }
+                4 => {
+                    let f: extern "C" fn(usize, usize, usize, usize) -> usize =
+                        std::mem::transmute(sym);
+                    f(args.words[0], args.words[1], args.words[2], args.words[3])
+                }
+                5 => {
+                    let f: extern "C" fn(usize, usize, usize, usize, usize) -> usize =
+                        std::mem::transmute(sym);
+                    f(
+                        args.words[0],
+                        args.words[1],
+                        args.words[2],
+                        args.words[3],
+                        args.words[4],
+                    )
+                }
+                6 => {
+                    let f: extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize =
+                        std::mem::transmute(sym);
+                    f(
+                        args.words[0],
+                        args.words[1],
+                        args.words[2],
+                        args.words[3],
+                        args.words[4],
+                        args.words[5],
+                    )
+                }
+                _ => {
+                    return Err(VmError::TypeError(
+                        "ffi supports up to 6 native arguments in v0.1".into(),
+                    ))
+                }
+            }
+        };
+        match ret {
+            FfiType::Void => Ok(Value::Nil),
+            FfiType::Bool => Ok(Value::Bool(out != 0)),
+            FfiType::Int64 => Ok(Value::Integer(out as i64)),
+            FfiType::UInt64 | FfiType::Ptr => Ok(Value::Integer(out as i64)),
+            FfiType::CString => {
+                if out == 0 {
+                    Ok(Value::Nil)
+                } else {
+                    let s = unsafe {
+                        let ptr = out as *const c_char;
+                        std::ffi::CStr::from_ptr(ptr)
+                            .to_str()
+                            .map_err(|_| VmError::TypeError("ffi returned invalid UTF-8".into()))?
+                            .to_string()
+                    };
+                    Ok(Value::String(s))
+                }
+            }
+        }
+    }
+
+    fn load_module_from_search_path(&mut self, name: &str) -> Result<Value, VmError> {
+        for base in &self.config.module_search_paths {
+            let mut source_path = base.clone();
+            source_path.push(format!("{name}.rua"));
+            if source_path.exists() {
+                return self.load_source_module(name, &source_path);
+            }
+            let mut bytecode_path = base.clone();
+            bytecode_path.push(format!("{name}.ruac"));
+            if bytecode_path.exists() {
+                return self.load_bytecode_module(name, &bytecode_path);
+            }
+        }
+        Err(VmError::UnknownGlobal(format!("module:{name}")))
+    }
+
+    fn load_source_module(&mut self, name: &str, path: &Path) -> Result<Value, VmError> {
+        let bytes = fs::read(path).map_err(|e| VmError::TypeError(format!("module read error: {e}")))?;
+        if bytes.len() > self.config.max_module_bytes {
+            return Err(VmError::LimitExceeded {
+                limit: "max_module_bytes",
+                max: self.config.max_module_bytes,
+            });
+        }
+        self.verify_module_if_required(name, &bytes, path)?;
+        let source =
+            String::from_utf8(bytes).map_err(|_| VmError::TypeError("module source is not UTF-8".into()))?;
+        let module =
+            compile_source(&source).map_err(|e| VmError::TypeError(format!("compile error: {e}")))?;
+        let mut nested = Vm::with_config(module, self.config.clone());
+        nested.host_functions = std::mem::take(&mut self.host_functions);
+        let value = nested.run();
+        self.host_functions = std::mem::take(&mut nested.host_functions);
+        let value = value?;
+        self.import_external_value(&nested, &value)
+    }
+
+    fn load_bytecode_module(&mut self, name: &str, path: &Path) -> Result<Value, VmError> {
+        let bytes = fs::read(path).map_err(|e| VmError::TypeError(format!("module read error: {e}")))?;
+        if bytes.len() > self.config.max_module_bytes {
+            return Err(VmError::LimitExceeded {
+                limit: "max_module_bytes",
+                max: self.config.max_module_bytes,
+            });
+        }
+        self.verify_module_if_required(name, &bytes, path)?;
+        let module = decode_module(&bytes)
+            .map_err(|e| VmError::InvalidBytecode(e.to_string()))?;
+        validate_module(&module).map_err(|e| VmError::InvalidBytecode(e.to_string()))?;
+        let mut nested = Vm::with_config(module, self.config.clone());
+        nested.host_functions = std::mem::take(&mut self.host_functions);
+        let value = nested.run();
+        self.host_functions = std::mem::take(&mut nested.host_functions);
+        let value = value?;
+        self.import_external_value(&nested, &value)
+    }
+
+    fn import_external_value(&mut self, other: &Vm, value: &Value) -> Result<Value, VmError> {
+        match value {
+            Value::Integer(v) => Ok(Value::Integer(*v)),
+            Value::Float(v) => Ok(Value::Float(*v)),
+            Value::String(v) => Ok(Value::String(v.clone())),
+            Value::Bool(v) => Ok(Value::Bool(*v)),
+            Value::Nil => Ok(Value::Nil),
+            Value::Pid(v) => Ok(Value::Pid(*v)),
+            Value::Builtin(_) | Value::Closure(_) => Err(VmError::SecurityViolation(
+                "module exports cannot contain closures/builtins".into(),
+            )),
+            Value::List(id) => {
+                let Some(HeapObject::List(items)) = other.heap.get(*id) else {
+                    return Err(VmError::TypeError("invalid external list object".into()));
+                };
+                let mut imported = Vec::with_capacity(items.len());
+                for item in items {
+                    imported.push(self.import_external_value(other, item)?);
+                }
+                Ok(self.heap.alloc_list(imported))
+            }
+            Value::Record(id) => {
+                let Some(HeapObject::Record { fields, meta }) = other.heap.get(*id) else {
+                    return Err(VmError::TypeError("invalid external record object".into()));
+                };
+                let mut imported = BTreeMap::new();
+                for (k, v) in fields {
+                    imported.insert(k.clone(), self.import_external_value(other, v)?);
+                }
+                let imported_meta = match meta {
+                    Some(v) => Some(self.import_external_value(other, v)?),
+                    None => None,
+                };
+                Ok(self.heap.alloc_record(imported, imported_meta))
+            }
+        }
+    }
+
+    fn verify_module_if_required(
+        &self,
+        module_name: &str,
+        bytes: &[u8],
+        module_path: &Path,
+    ) -> Result<(), VmError> {
+        #[cfg(not(feature = "builtin_sha256_verify"))]
+        let _ = bytes;
+        let sig_path = module_path.with_extension(format!(
+            "{}.sig",
+            module_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+        ));
+        let sig = fs::read(&sig_path).unwrap_or_default();
+        if self.config.require_signed_modules && sig.is_empty() {
+            return Err(VmError::ModuleVerificationFailed(module_name.into()));
+        }
+        if sig.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(verifier) = &self.module_verifier {
+            if verifier(module_name, bytes, &sig) {
+                return Ok(());
+            }
+            return Err(VmError::ModuleVerificationFailed(module_name.into()));
+        }
+
+        #[cfg(feature = "builtin_sha256_verify")]
+        {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            let digest = hasher.finalize();
+            let expected = sig
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect::<Vec<_>>();
+            let hex = hex_lower(&digest);
+            if expected == hex.as_bytes() {
+                return Ok(());
+            }
+        }
+
+        Err(VmError::ModuleVerificationFailed(module_name.into()))
+    }
+
+    fn enforce_limits(&self) -> Result<(), VmError> {
+        if self.processes.len() > self.config.max_processes {
+            return Err(VmError::LimitExceeded {
+                limit: "max_processes",
+                max: self.config.max_processes,
+            });
+        }
+        if self.heap.live_objects() > self.config.max_heap_objects {
+            return Err(VmError::LimitExceeded {
+                limit: "max_heap_objects",
+                max: self.config.max_heap_objects,
+            });
+        }
+        for process in self.processes.values() {
+            if process.stack.len() > self.config.max_stack_values {
+                return Err(VmError::LimitExceeded {
+                    limit: "max_stack_values",
+                    max: self.config.max_stack_values,
+                });
+            }
+            if process.call_stack.len() > self.config.max_call_depth {
+                return Err(VmError::LimitExceeded {
+                    limit: "max_call_depth",
+                    max: self.config.max_call_depth,
+                });
+            }
+            if process.mailbox.len() > self.config.max_mailbox_messages {
+                return Err(VmError::LimitExceeded {
+                    limit: "max_mailbox_messages",
+                    max: self.config.max_mailbox_messages,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn fail<T>(&mut self, err: VmError) -> Result<T, VmError> {
+        let process_id = self.main_pid;
+        let stack_trace = self
+            .process(process_id)
+            .map(|p| {
+                p.call_stack
+                    .iter()
+                    .rev()
+                    .map(|frame| VmFrameTrace {
+                        function: self
+                            .module
+                            .functions
+                            .get(frame.function.0)
+                            .and_then(|f| f.name.clone()),
+                        function_id: frame.function.0,
+                        ip: frame.ip,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.last_diagnostic = Some(VmDiagnostic {
+            code: vm_error_code(&err),
+            message: err.to_string(),
+            process_id,
+            stack_trace,
+        });
+        Err(err)
+    }
+}
+
+fn vm_error_code(err: &VmError) -> &'static str {
+    match err {
+        VmError::Halted => "E_HALTED",
+        VmError::InvalidInstructionPointer => "E_IP",
+        VmError::StackUnderflow => "E_STACK",
+        VmError::TypeError(_) => "E_TYPE",
+        VmError::UnknownGlobal(_) => "E_UNKNOWN_GLOBAL",
+        VmError::UnknownField(_) => "E_UNKNOWN_FIELD",
+        VmError::InvalidCallTarget => "E_CALL_TARGET",
+        VmError::ArityMismatch { .. } => "E_ARITY",
+        VmError::FunctionOutOfBounds => "E_FUNCTION_BOUNDS",
+        VmError::ReceiveBlocked => "E_RECEIVE_BLOCKED",
+        VmError::InvalidJumpTarget(_) => "E_JUMP",
+        VmError::TimeoutValueInvalid => "E_TIMEOUT",
+        VmError::ProcessNotFound(_) => "E_PROCESS",
+        VmError::InvalidRestartStrategy(_) => "E_RESTART",
+        VmError::LimitExceeded { .. } => "E_LIMIT",
+        VmError::SecurityViolation(_) => "E_SECURITY",
+        VmError::InvalidBytecode(_) => "E_BYTECODE",
+        VmError::ModuleVerificationFailed(_) => "E_MODULE_VERIFY",
+    }
+}
+
+fn infer_unrestricted_signature(args: &[Value]) -> FfiSignature {
+    let params = args
+        .iter()
+        .map(|v| match v {
+            Value::String(_) => FfiType::CString,
+            Value::Bool(_) => FfiType::Bool,
+            _ => FfiType::UInt64,
+        })
+        .collect::<Vec<_>>();
+    FfiSignature {
+        params,
+        ret: FfiType::UInt64,
+    }
+}
+
+fn parse_ffi_type_token(token: &str) -> Option<FfiType> {
+    match token {
+        "i64" => Some(FfiType::Int64),
+        "u64" => Some(FfiType::UInt64),
+        "bool" => Some(FfiType::Bool),
+        "cstring" => Some(FfiType::CString),
+        "ptr" => Some(FfiType::Ptr),
+        "void" => Some(FfiType::Void),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "builtin_sha256_verify")]
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
+}
+
+struct NativeFfiArgs {
+    words: Vec<usize>,
+    string_storage: Vec<CString>,
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for lib in self.ffi_libs.values() {
+            if !lib.handle.is_null() {
+                unsafe {
+                    let _ = dlclose(lib.handle);
+                }
+            }
         }
     }
 }

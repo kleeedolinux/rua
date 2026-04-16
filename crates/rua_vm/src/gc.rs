@@ -45,6 +45,9 @@ pub struct GcTelemetry {
     pub total_collected: usize,
     pub total_promoted: usize,
     pub live_objects: usize,
+    pub total_gc_work_units: usize,
+    pub last_cycle_work_units: usize,
+    pub max_cycle_work_units: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,19 @@ pub struct GcConfig {
     pub min_threshold: usize,
     pub growth_percent: usize,
     pub full_every_minor: usize,
+    pub allocator_strategy: AllocatorStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorStrategy {
+    FreeList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcProfile {
+    LowLatency,
+    Balanced,
+    Throughput,
 }
 
 impl Default for GcConfig {
@@ -62,6 +78,7 @@ impl Default for GcConfig {
             min_threshold: 1024,
             growth_percent: 100,
             full_every_minor: 8,
+            allocator_strategy: AllocatorStrategy::FreeList,
         }
     }
 }
@@ -109,6 +126,9 @@ impl Heap {
                 total_collected: 0,
                 total_promoted: 0,
                 live_objects: 0,
+                total_gc_work_units: 0,
+                last_cycle_work_units: 0,
+                max_cycle_work_units: 0,
             },
             cycle: None,
         }
@@ -124,6 +144,33 @@ impl Heap {
 
     pub fn telemetry(&self) -> &GcTelemetry {
         &self.telemetry
+    }
+
+    pub fn set_profile(&mut self, profile: GcProfile) {
+        match profile {
+            GcProfile::LowLatency => {
+                self.config.threshold = 512;
+                self.config.min_threshold = 512;
+                self.config.full_every_minor = 16;
+                self.config.growth_percent = 50;
+            }
+            GcProfile::Balanced => {
+                self.config.threshold = 1024;
+                self.config.min_threshold = 1024;
+                self.config.full_every_minor = 8;
+                self.config.growth_percent = 100;
+            }
+            GcProfile::Throughput => {
+                self.config.threshold = 4096;
+                self.config.min_threshold = 4096;
+                self.config.full_every_minor = 4;
+                self.config.growth_percent = 200;
+            }
+        }
+    }
+
+    pub fn live_objects(&self) -> usize {
+        self.objects.iter().filter(|slot| slot.is_some()).count()
     }
 
     pub fn alloc_list(&mut self, items: Vec<Value>) -> Value {
@@ -273,11 +320,15 @@ impl Heap {
 
     fn finish_cycle(&mut self) -> GcStats {
         let cycle = self.cycle.take().expect("finish_cycle without active cycle");
+        let work = cycle.live + cycle.collected;
 
         self.allocated_since_gc = 0;
         self.telemetry.total_collected += cycle.collected;
         self.telemetry.total_promoted += cycle.promoted;
         self.telemetry.live_objects = cycle.live;
+        self.telemetry.total_gc_work_units += work;
+        self.telemetry.last_cycle_work_units = work;
+        self.telemetry.max_cycle_work_units = self.telemetry.max_cycle_work_units.max(work);
         if cycle.sweep_old {
             self.telemetry.full_collections += 1;
         } else {
@@ -296,7 +347,8 @@ impl Heap {
 
     fn alloc(&mut self, obj: HeapObject) -> ObjRef {
         self.allocated_since_gc += 1;
-        if let Some(idx) = self.free_list.pop() {
+        let reuse_freelist = matches!(self.config.allocator_strategy, AllocatorStrategy::FreeList);
+        if reuse_freelist && let Some(idx) = self.free_list.pop() {
             self.objects[idx] = Some(Cell {
                 obj,
                 generation: Generation::Young,

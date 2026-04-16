@@ -16,6 +16,10 @@ pub enum VmError {
     TimeoutValueInvalid,
     ProcessNotFound(u64),
     InvalidRestartStrategy(String),
+    LimitExceeded { limit: &'static str, max: usize },
+    SecurityViolation(String),
+    InvalidBytecode(String),
+    ModuleVerificationFailed(String),
 }
 
 impl fmt::Display for VmError {
@@ -37,6 +41,14 @@ impl fmt::Display for VmError {
             Self::TimeoutValueInvalid => write!(f, "receive after expects a non-negative integer timeout"),
             Self::ProcessNotFound(pid) => write!(f, "process not found: {pid}"),
             Self::InvalidRestartStrategy(s) => write!(f, "invalid restart strategy: {s}"),
+            Self::LimitExceeded { limit, max } => {
+                write!(f, "limit exceeded: {limit} (max {max})")
+            }
+            Self::SecurityViolation(msg) => write!(f, "security violation: {msg}"),
+            Self::InvalidBytecode(msg) => write!(f, "invalid bytecode: {msg}"),
+            Self::ModuleVerificationFailed(name) => {
+                write!(f, "module verification failed: {name}")
+            }
         }
     }
 }

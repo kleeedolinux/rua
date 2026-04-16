@@ -45,6 +45,7 @@ pub enum Builtin {
     StringLower,
     StringUpper,
     TableLen,
+    FfiRegister,
     Ffi,
 }
 
