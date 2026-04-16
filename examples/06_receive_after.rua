@@ -1,0 +1,6 @@
+receive
+  case { type = "never" } ->
+    1
+  after 1000 ->
+    99
+end

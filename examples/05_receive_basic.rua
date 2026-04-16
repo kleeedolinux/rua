@@ -1,0 +1,6 @@
+send(self(), { type = "ping", value = 7 })
+
+receive
+  case { type = "ping", value = x } ->
+    x
+end

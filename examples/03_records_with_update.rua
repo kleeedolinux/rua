@@ -1,0 +1,3 @@
+local pessoa = { nome = "Lia", idade = 20 }
+local adulta = { pessoa with idade = 21 }
+adulta.idade

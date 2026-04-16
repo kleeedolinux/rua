@@ -1,0 +1,10 @@
+local pessoa = with_meta(
+  { nome = "Lia" },
+  {
+    show = fn(self)
+      "Pessoa(" .. self.nome .. ")"
+    end
+  }
+)
+
+pessoa.show(pessoa)

@@ -1,0 +1,6 @@
+local f = fn(x)
+  local y = x + 1
+  y * 2
+end
+
+f(20)
