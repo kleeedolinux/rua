@@ -1,0 +1,11 @@
+[package]
+name = "rua_capi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+rua = { path = "../.." }
+rua_vm = { path = "../rua_vm" }
