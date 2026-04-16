@@ -6,6 +6,7 @@ use super::{ConstId, FunctionId, LocalId, ReceiveAfter, ReceiveCase, UpvalueId};
 pub enum CaptureRef {
     Local(LocalId),
     Upvalue(UpvalueId),
+    SelfClosure,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +16,7 @@ pub enum Instr {
     PushNil,
     LoadLocal(LocalId),
     LoadUpvalue(UpvalueId),
+    LoadSelf,
     LoadGlobal(ConstId),
     BindLocal(LocalId),
     Unary(UnaryOp),

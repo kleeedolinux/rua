@@ -27,6 +27,7 @@ pub fn compile_program(program: &Program) -> Module {
 enum Resolved {
     Local(LocalId),
     Upvalue(UpvalueId),
+    SelfClosure,
 }
 
 #[derive(Default)]
@@ -40,6 +41,7 @@ struct Scope {
 struct ScopeRef {
     locals: HashMap<String, LocalId>,
     upvalues: HashMap<String, UpvalueId>,
+    self_name: Option<String>,
 }
 
 struct FunctionBuilder {
@@ -49,6 +51,7 @@ struct FunctionBuilder {
     constants: Vec<Constant>,
     code: Vec<Instr>,
     scope: Scope,
+    self_name: Option<String>,
     upvalue_map: HashMap<String, UpvalueId>,
     captures: Vec<CaptureRef>,
 }
@@ -72,6 +75,7 @@ impl FunctionBuilder {
             constants: Vec::new(),
             code: Vec::new(),
             scope,
+            self_name: None,
             upvalue_map: HashMap::new(),
             captures: Vec::new(),
         }
@@ -126,10 +130,19 @@ impl FunctionBuilder {
             }
         }
 
+        if self.self_name.as_deref() == Some(name) {
+            return Some(Resolved::SelfClosure);
+        }
+
         let parent = self.scope.parent.as_ref()?;
 
         if let Some(local) = parent.locals.get(name).copied() {
             let upvalue = self.intern_upvalue(name.to_string(), CaptureRef::Local(local));
+            return Some(Resolved::Upvalue(upvalue));
+        }
+
+        if parent.self_name.as_deref() == Some(name) {
+            let upvalue = self.intern_upvalue(name.to_string(), CaptureRef::SelfClosure);
             return Some(Resolved::Upvalue(upvalue));
         }
 
@@ -153,16 +166,40 @@ impl FunctionBuilder {
         id
     }
 
-    fn to_scope_ref(&self) -> ScopeRef {
+    fn to_scope_ref(&mut self) -> ScopeRef {
         let mut locals = HashMap::new();
         for frame in &self.scope.frames {
             for (k, v) in frame {
                 locals.insert(k.clone(), *v);
             }
         }
+
+        let mut forced_names = Vec::new();
+        if let Some(parent) = &self.scope.parent {
+            for name in parent.locals.keys() {
+                if !locals.contains_key(name) {
+                    forced_names.push(name.clone());
+                }
+            }
+            if let Some(name) = &parent.self_name
+                && !locals.contains_key(name)
+            {
+                forced_names.push(name.clone());
+            }
+            for name in parent.upvalues.keys() {
+                if !locals.contains_key(name) {
+                    forced_names.push(name.clone());
+                }
+            }
+        }
+        for name in forced_names {
+            let _ = self.resolve(&name);
+        }
+
         ScopeRef {
             locals,
             upvalues: self.upvalue_map.clone(),
+            self_name: self.self_name.clone(),
         }
     }
 
@@ -217,7 +254,30 @@ impl ModuleBuilder {
             match item {
                 Item::Local(binding) => {
                     let local = fb.reserve_local(binding.name.clone());
-                    self.compile_expr(fb, &binding.value);
+                    if let Expr::Fn { params, body } = &binding.value {
+                        let mut nested =
+                            FunctionBuilder::new(None, params.len(), Some(fb.to_scope_ref()));
+                        nested.self_name = Some(binding.name.clone());
+                        for (i, param) in params.iter().enumerate() {
+                            nested
+                                .scope
+                                .frames
+                                .last_mut()
+                                .expect("scope has at least one frame")
+                                .insert(param.clone(), LocalId(i));
+                        }
+                        self.compile_expr(&mut nested, body);
+                        nested.emit(Instr::Return);
+                        let captures = nested.captures.clone();
+                        let func_id = FunctionId(self.functions.len());
+                        self.functions.push(nested.finish());
+                        fb.emit(Instr::MakeClosure {
+                            function: func_id,
+                            captures,
+                        });
+                    } else {
+                        self.compile_expr(fb, &binding.value);
+                    }
                     fb.emit(Instr::BindLocal(local));
                 }
                 Item::Expr(expr) => {
@@ -263,6 +323,9 @@ impl ModuleBuilder {
                         Resolved::Upvalue(upvalue) => {
                             fb.emit(Instr::LoadUpvalue(upvalue));
                         }
+                        Resolved::SelfClosure => {
+                            fb.emit(Instr::LoadSelf);
+                        }
                     }
                 } else {
                     let c = fb.add_const(Constant::Symbol(name.clone()));
@@ -298,10 +361,12 @@ impl ModuleBuilder {
             } => {
                 self.compile_expr(fb, condition);
                 let jmp_false = fb.emit(Instr::JumpIfFalse(usize::MAX));
+                fb.emit(Instr::Pop);
                 self.compile_expr(fb, then_branch);
                 let jmp_end = fb.emit(Instr::Jump(usize::MAX));
                 let else_target = fb.code.len();
                 fb.patch_jump_target(jmp_false, else_target);
+                fb.emit(Instr::Pop);
                 self.compile_expr(fb, else_branch);
                 let end_target = fb.code.len();
                 fb.patch_jump_target(jmp_end, end_target);
@@ -404,11 +469,12 @@ impl ModuleBuilder {
     ) -> IrReceiveCase {
         let mut bindings = Vec::new();
         let pattern = self.compile_pattern(fb, &case.pattern, &mut bindings);
-        let handler = self.compile_case_handler(fb, &bindings, &case.body);
+        let (handler, captures) = self.compile_case_handler(fb, &bindings, &case.body);
         IrReceiveCase {
             pattern,
             bindings: bindings.len(),
             handler,
+            captures,
         }
     }
 
@@ -417,20 +483,23 @@ impl ModuleBuilder {
         fb: &mut FunctionBuilder,
         after: &AstReceiveAfter,
     ) -> IrReceiveAfter {
-        let timeout_handler = self.compile_case_handler(fb, &[], &after.timeout);
-        let body_handler = self.compile_case_handler(fb, &[], &after.body);
+        let (timeout_handler, timeout_captures) =
+            self.compile_case_handler(fb, &[], &after.timeout);
+        let (body_handler, body_captures) = self.compile_case_handler(fb, &[], &after.body);
         IrReceiveAfter {
             timeout_handler,
+            timeout_captures,
             body_handler,
+            body_captures,
         }
     }
 
     fn compile_case_handler(
         &mut self,
-        fb: &FunctionBuilder,
+        fb: &mut FunctionBuilder,
         bindings: &[String],
         body: &Expr,
-    ) -> FunctionId {
+    ) -> (FunctionId, Vec<CaptureRef>) {
         let mut nested = FunctionBuilder::new(None, bindings.len(), Some(fb.to_scope_ref()));
         for (i, name) in bindings.iter().enumerate() {
             nested
@@ -442,9 +511,10 @@ impl ModuleBuilder {
         }
         self.compile_expr(&mut nested, body);
         nested.emit(Instr::Return);
+        let captures = nested.captures.clone();
         let func_id = FunctionId(self.functions.len());
         self.functions.push(nested.finish());
-        func_id
+        (func_id, captures)
     }
 
     fn compile_pattern(
@@ -547,7 +617,14 @@ mod tests {
         let module = compile_source(source).unwrap();
         assert!(module.functions.len() >= 2);
         let nested = &module.functions[0];
-        assert!(nested.upvalue_count >= 1);
+        assert!(nested
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::LoadSelf)));
+        assert!(!nested
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::LoadGlobal(_))));
     }
 
     #[test]

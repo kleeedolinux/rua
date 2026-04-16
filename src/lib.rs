@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod bytecode;
 pub mod frontend;
 pub mod ir;
 pub mod lexer;
