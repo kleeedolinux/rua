@@ -1,0 +1,7 @@
+local cfg = require("config")
+
+if cfg.env == "prod" then
+  "running-in-prod"
+else
+  "running-in-nonprod"
+end

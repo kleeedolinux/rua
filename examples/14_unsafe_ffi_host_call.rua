@@ -1,0 +1,2 @@
+unsafe ffi_register("libc.strlen", "libc.so.6", "strlen", "u64", "cstring")
+unsafe ffi("libc.strlen", "Rua-FFI")

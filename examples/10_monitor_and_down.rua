@@ -1,0 +1,10 @@
+local child = spawn(fn()
+  exit({ type = "error", reason = "boom" })
+end)
+
+local ref = monitor(child)
+
+receive
+  case { type = "DOWN", ref = r, pid = pid, reason = reason } ->
+    { ok = true, ref = r, pid = pid, reason = reason }
+end

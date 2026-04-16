@@ -1,0 +1,34 @@
+local parent = self()
+
+local counter_loop = fn(state)
+  receive
+    case { type = "inc", n = n } ->
+      counter_loop(state + n)
+
+    case { type = "get", from = from } ->
+      send(from, { type = "state", value = state })
+      counter_loop(state)
+
+    case { type = "stop" } ->
+      state
+  end
+end
+
+local worker = fn()
+  send(parent, { type = "worker_up" })
+  counter_loop(0)
+end
+
+local counter = supervisor(worker, "permanent", 3, 1000)
+
+send(counter, { type = "inc", n = 10 })
+send(counter, { type = "inc", n = 32 })
+send(counter, { type = "get", from = parent })
+
+receive
+  case { type = "worker_up" } ->
+    receive
+      case { type = "state", value = x } ->
+        x
+    end
+end

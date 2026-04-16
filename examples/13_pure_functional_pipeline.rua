@@ -1,0 +1,16 @@
+local normalize = fn(user)
+  local clean_name = string.upper(user.nome)
+  local safe_age = math.max(user.idade, 0)
+  { user with nome = clean_name, idade = safe_age }
+end
+
+local classify = fn(user)
+  if user.idade >= 18 then
+    { user with status = "adult" }
+  else
+    { user with status = "minor" }
+  end
+end
+
+local input = { nome = "lia", idade = 20, city = "sp" }
+classify(normalize(input))

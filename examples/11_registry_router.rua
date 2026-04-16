@@ -1,0 +1,23 @@
+local parent = self()
+
+local router_loop = fn()
+  receive
+    case { type = "echo", from = from, payload = payload } ->
+      send(from, { type = "echo_reply", payload = payload })
+      router_loop()
+
+    case { type = "stop" } ->
+      "stopped"
+  end
+end
+
+local router = spawn(fn() router_loop() end)
+register("router", router)
+
+local target = whereis("router")
+send(target, { type = "echo", from = parent, payload = "hello-router" })
+
+receive
+  case { type = "echo_reply", payload = payload } ->
+    payload
+end
