@@ -31,7 +31,11 @@ typedef enum RuaErrorCode {
     RUA_ERROR_RECEIVE_BLOCKED = 11,
     RUA_ERROR_HALTED = 12,
     RUA_ERROR_PROCESS_NOT_FOUND = 13,
-    RUA_ERROR_INVALID_RESTART_STRATEGY = 14
+    RUA_ERROR_INVALID_RESTART_STRATEGY = 14,
+    RUA_ERROR_LIMIT_EXCEEDED = 15,
+    RUA_ERROR_SECURITY_VIOLATION = 16,
+    RUA_ERROR_INVALID_BYTECODE = 17,
+    RUA_ERROR_MODULE_VERIFICATION_FAILED = 18
 } RuaErrorCode;
 
 /*
@@ -49,6 +53,7 @@ typedef const char* (*RuaHostCallback)(void* user_data, size_t argc, const char*
 /* VM lifecycle */
 RuaVmHandle* rua_vm_new_from_source(const char* source);
 RuaVmHandle* rua_vm_new_from_file(const char* path);
+RuaVmHandle* rua_vm_new_from_bytecode_file(const char* path);
 void rua_vm_free(RuaVmHandle* vm);
 
 /* VM execution */
@@ -69,6 +74,18 @@ int rua_vm_gc_set_threshold(RuaVmHandle* vm, size_t threshold);
 int rua_vm_gc_set_full_every_minor(RuaVmHandle* vm, size_t count);
 int rua_vm_gc_collect_now(RuaVmHandle* vm);
 char* rua_vm_gc_stats(RuaVmHandle* vm);
+int rua_vm_apply_embedded_profile(RuaVmHandle* vm);
+int rua_vm_set_limits(
+    RuaVmHandle* vm,
+    size_t max_steps,
+    size_t max_processes,
+    size_t max_mailbox_messages,
+    size_t max_stack_values,
+    size_t max_heap_objects
+);
+int rua_vm_add_module_search_path(RuaVmHandle* vm, const char* path);
+int rua_vm_set_require_signed_modules(RuaVmHandle* vm, int required);
+int rua_vm_set_allow_unrestricted_system_ffi(RuaVmHandle* vm, int allowed);
 
 /* Register named host function for unsafe ffi("name", ...) */
 int rua_vm_register_host_fn(
@@ -81,6 +98,14 @@ int rua_vm_register_native_module_source(
     RuaVmHandle* vm,
     const char* name,
     const char* source
+);
+int rua_vm_register_system_ffi_capability(
+    RuaVmHandle* vm,
+    const char* cap_name,
+    const char* lib_name,
+    const char* symbol_name,
+    const char* ret_type,
+    const char* param_types_csv
 );
 
 /* Convenience one-shot APIs */

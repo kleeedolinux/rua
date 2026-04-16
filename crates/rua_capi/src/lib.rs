@@ -1,9 +1,11 @@
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::PathBuf;
 
+use rua::bytecode::decode_module;
 use rua::frontend::compile_source;
-use rua_vm::{Value, Vm, VmError};
+use rua_vm::{FfiSignature, FfiType, Value, Vm, VmError, VmProfile};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,10 @@ pub enum RuaErrorCode {
     Halted = 12,
     ProcessNotFound = 13,
     InvalidRestartStrategy = 14,
+    LimitExceeded = 15,
+    SecurityViolation = 16,
+    InvalidBytecode = 17,
+    ModuleVerificationFailed = 18,
 }
 
 pub type RuaHostCallback = unsafe extern "C" fn(
@@ -115,6 +121,10 @@ fn vm_error_code(err: &VmError) -> RuaErrorCode {
         VmError::Halted => RuaErrorCode::Halted,
         VmError::ProcessNotFound(_) => RuaErrorCode::ProcessNotFound,
         VmError::InvalidRestartStrategy(_) => RuaErrorCode::InvalidRestartStrategy,
+        VmError::LimitExceeded { .. } => RuaErrorCode::LimitExceeded,
+        VmError::SecurityViolation(_) => RuaErrorCode::SecurityViolation,
+        VmError::InvalidBytecode(_) => RuaErrorCode::InvalidBytecode,
+        VmError::ModuleVerificationFailed(_) => RuaErrorCode::ModuleVerificationFailed,
         _ => RuaErrorCode::RuntimeError,
     }
 }
@@ -173,6 +183,28 @@ pub extern "C" fn rua_vm_new_from_file(path: *const c_char) -> *mut RuaVmHandle 
         Err(_) => return std::ptr::null_mut(),
     };
 
+    Box::into_raw(Box::new(RuaVmHandle {
+        vm: Vm::new(module),
+        last_error: None,
+        last_error_code: RuaErrorCode::None,
+        last_result: None,
+    }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_new_from_bytecode_file(path: *const c_char) -> *mut RuaVmHandle {
+    let path = match cstr_to_str(path) {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let module = match decode_module(&bytes) {
+        Ok(m) => m,
+        Err(_) => return std::ptr::null_mut(),
+    };
     Box::into_raw(Box::new(RuaVmHandle {
         vm: Vm::new(module),
         last_error: None,
@@ -366,6 +398,87 @@ pub extern "C" fn rua_vm_gc_collect_now(vm: *mut RuaVmHandle) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_apply_embedded_profile(vm: *mut RuaVmHandle) -> c_int {
+    let handle = match handle_mut(vm) {
+        Ok(h) => h,
+        Err(_) => return 1,
+    };
+    handle.vm.set_profile(VmProfile::EmbeddedSmall);
+    clear_error(handle);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_set_limits(
+    vm: *mut RuaVmHandle,
+    max_steps: usize,
+    max_processes: usize,
+    max_mailbox_messages: usize,
+    max_stack_values: usize,
+    max_heap_objects: usize,
+) -> c_int {
+    let handle = match handle_mut(vm) {
+        Ok(h) => h,
+        Err(_) => return 1,
+    };
+    handle.vm.set_limits(
+        max_steps,
+        max_processes,
+        max_mailbox_messages,
+        max_stack_values,
+        max_heap_objects,
+    );
+    clear_error(handle);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_add_module_search_path(
+    vm: *mut RuaVmHandle,
+    path: *const c_char,
+) -> c_int {
+    let handle = match handle_mut(vm) {
+        Ok(h) => h,
+        Err(_) => return 1,
+    };
+    let p = match cstr_to_str(path) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(handle, RuaErrorCode::InvalidUtf8, e);
+            return 1;
+        }
+    };
+    handle.vm.add_module_search_path(PathBuf::from(p));
+    clear_error(handle);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_set_require_signed_modules(vm: *mut RuaVmHandle, required: c_int) -> c_int {
+    let handle = match handle_mut(vm) {
+        Ok(h) => h,
+        Err(_) => return 1,
+    };
+    handle.vm.set_require_signed_modules(required != 0);
+    clear_error(handle);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_set_allow_unrestricted_system_ffi(
+    vm: *mut RuaVmHandle,
+    allowed: c_int,
+) -> c_int {
+    let handle = match handle_mut(vm) {
+        Ok(h) => h,
+        Err(_) => return 1,
+    };
+    handle.vm.set_allow_unrestricted_system_ffi(allowed != 0);
+    clear_error(handle);
+    0
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rua_vm_gc_stats(vm: *mut RuaVmHandle) -> *mut c_char {
     let handle = match handle_mut(vm) {
         Ok(h) => h,
@@ -424,6 +537,84 @@ pub extern "C" fn rua_vm_register_host_fn(
         }
     });
 
+    clear_error(handle);
+    0
+}
+
+fn parse_ffi_type(name: &str) -> Option<FfiType> {
+    match name {
+        "i64" => Some(FfiType::Int64),
+        "u64" => Some(FfiType::UInt64),
+        "bool" => Some(FfiType::Bool),
+        "cstring" => Some(FfiType::CString),
+        "ptr" => Some(FfiType::Ptr),
+        "void" => Some(FfiType::Void),
+        _ => None,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rua_vm_register_system_ffi_capability(
+    vm: *mut RuaVmHandle,
+    cap_name: *const c_char,
+    lib_name: *const c_char,
+    symbol_name: *const c_char,
+    ret_type: *const c_char,
+    param_types_csv: *const c_char,
+) -> c_int {
+    let handle = match handle_mut(vm) {
+        Ok(h) => h,
+        Err(_) => return 1,
+    };
+    let cap_name = match cstr_to_str(cap_name) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(handle, RuaErrorCode::InvalidUtf8, e);
+            return 1;
+        }
+    };
+    let lib_name = match cstr_to_str(lib_name) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(handle, RuaErrorCode::InvalidUtf8, e);
+            return 1;
+        }
+    };
+    let symbol_name = match cstr_to_str(symbol_name) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(handle, RuaErrorCode::InvalidUtf8, e);
+            return 1;
+        }
+    };
+    let ret = match cstr_to_str(ret_type).ok().and_then(parse_ffi_type) {
+        Some(v) => v,
+        None => {
+            set_error(handle, RuaErrorCode::TypeError, "invalid ffi return type");
+            return 1;
+        }
+    };
+    let params_csv = match cstr_to_str(param_types_csv) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(handle, RuaErrorCode::InvalidUtf8, e);
+            return 1;
+        }
+    };
+    let mut params = Vec::new();
+    for part in params_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let Some(ty) = parse_ffi_type(part) else {
+            set_error(handle, RuaErrorCode::TypeError, format!("invalid ffi param type: {part}"));
+            return 1;
+        };
+        params.push(ty);
+    }
+    handle.vm.register_system_ffi_capability(
+        cap_name.to_string(),
+        lib_name.to_string(),
+        symbol_name.to_string(),
+        FfiSignature { params, ret },
+    );
     clear_error(handle);
     0
 }
