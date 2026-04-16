@@ -19,7 +19,7 @@ jobs:
           - { name: win-x64, target: x86_64-pc-windows-msvc, os: windows-latest, use_msvc: true }
           - { name: win-x86, target: i686-pc-windows-msvc, os: windows-latest, use_msvc: true }
           - { name: win-arm, target: aarch64-pc-windows-msvc, os: windows-latest, use_msvc: true, allow_failure: true }
-          - { name: mac-x64, target: x86_64-apple-darwin, os: macos-13 }
+          - { name: mac-x64, target: x86_64-apple-darwin, os: macos-14 }
           - { name: mac-arm, target: aarch64-apple-darwin, os: macos-14 }
           - { name: linux-x64, target: x86_64-unknown-linux-gnu.2.17, os: ubuntu-latest }
           - { name: linux-arm, target: aarch64-unknown-linux-gnu.2.17, os: ubuntu-latest, allow_failure: true }
