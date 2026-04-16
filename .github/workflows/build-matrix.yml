@@ -1,18 +1,66 @@
 name: Build Matrix
 
 on:
-  push:
-    branches: ["master", "main"]
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  prepare_release_tag:
+    name: Prepare Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.resolve_tag.outputs.release_tag }}
+      should_release: ${{ steps.resolve_tag.outputs.should_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve / Create Tag
+        id: resolve_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*\"\\([^\"]\\+\\)\".*/\\1/p' version.rua | head -n1)"
+          if [[ -z "$version" ]]; then
+            echo "Failed to parse version from version.rua"
+            exit 1
+          fi
+
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag already exists on origin: $tag"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "$tag"
+            git push origin "$tag"
+            echo "Created and pushed tag: $tag"
+          fi
+
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.name }})
+    needs: prepare_release_tag
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure == true }}
     strategy:
@@ -95,7 +143,7 @@ jobs:
 
           if (Test-Path $outDir) {
             Get-ChildItem $outDir | ForEach-Object {
-              if ($_.Name -in @("rua", "rua.exe", "rua_capi.dll", "rua_capi.lib", "rua_capi.exp", "librua_capi.dylib", "librua_capi.a", "librua_capi.so")) {
+              if ($_.Name -in @("rua", "rua.exe")) {
                 Copy-Item $_.FullName (Join-Path $artifactDir $_.Name) -Force
               }
             }
@@ -115,8 +163,8 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Release Assets
-        if: ${{ always() }}
+        if: ${{ always() && needs.prepare_release_tag.outputs.should_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare_release_tag.outputs.release_tag }}
           files: dist/rua-${{ matrix.name }}.zip
