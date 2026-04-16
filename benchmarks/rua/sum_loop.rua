@@ -1,0 +1,9 @@
+local sum_to = fn(n, acc)
+  if n == 0 then
+    acc
+  else
+    sum_to(n - 1, acc + n)
+  end
+end
+
+sum_to(200000, 0)
