@@ -1,0 +1,20 @@
+[workspace]
+members = [".", "crates/rua_vm", "crates/rua_cli", "crates/rua_capi"]
+resolver = "2"
+
+[package]
+name = "rua"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+incremental = false
+overflow-checks = false
